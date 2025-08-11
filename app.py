@@ -2,91 +2,145 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from transformers import pipeline
 
-# Create a Flask application instance
+# -------------------------------------------------------------
+# Flask App Setup
+# -------------------------------------------------------------
+
+# Create a Flask application instance (this is the web server)
 app = Flask(__name__)
 
 # Enable CORS (Cross-Origin Resource Sharing) for development
-# This allows requests from your frontend (e.g., SvelteKit running on localhost:5173)
+# This is necessary so that your frontend running on a different port
+# (e.g., SvelteKit on localhost:5173) can make requests to this backend
 CORS(app)
 
-# Lazy-loaded model variables (initialized only when first needed)
-# This saves time during startup and only loads models into memory when an endpoint is called
+# -------------------------------------------------------------
+# Lazy-Loaded Models
+# -------------------------------------------------------------
+
+# These variables will store our loaded AI models.
+# We keep them as None until they are actually used, to save startup time.
 _sentiment_pipe = None
 _summarize_pipe = None
 
+# Optional guard to avoid extremely large input texts in demo usage
+MAX_INPUT_CHARS = 8000  # You can increase this if you want
+
+# -------------------------------------------------------------
+# Helper Functions to Load Models
+# -------------------------------------------------------------
+
 def get_sentiment():
     """
-    Load (if not already loaded) and return the sentiment analysis pipeline.
-    - This uses a pre-trained model from Hugging Face to classify text as POSITIVE/NEGATIVE/NEUTRAL.
+    Load and return the multilingual sentiment analysis pipeline.
+    - This model can understand multiple languages (EN, ES, FR, etc.)
+    - The pipeline object is stored globally so it's loaded only once.
     """
     global _sentiment_pipe
     if _sentiment_pipe is None:
-        _sentiment_pipe = pipeline("sentiment-analysis")  # Default: DistilBERT-based model
+        # 'sentiment-analysis' task will use the given multilingual model
+        _sentiment_pipe = pipeline(
+            "sentiment-analysis",
+            model="tabularisai/multilingual-sentiment-analysis"
+        )
     return _sentiment_pipe
 
 def get_summarizer():
     """
-    Load (if not already loaded) and return the text summarization pipeline.
-    - This uses the T5-small model to create a short summary of the input text.
+    Load and return the multilingual summarization pipeline.
+    - This uses an mT5-based model trained on the XLSum dataset.
+    - The tokenizer is specified to match the model.
+    - Summarization works best on moderate-length inputs (few paragraphs).
     """
     global _summarize_pipe
     if _summarize_pipe is None:
         _summarize_pipe = pipeline(
             "summarization",
-            model="t5-small",        # Pre-trained summarization model
-            tokenizer="t5-small"     # Tokenizer that matches the model
+            model="csebuetnlp/mT5_multilingual_XLSum",
+            tokenizer="csebuetnlp/mT5_multilingual_XLSum"
         )
     return _summarize_pipe
+
+# -------------------------------------------------------------
+# API Endpoints
+# -------------------------------------------------------------
 
 @app.get("/health")
 def health():
     """
     Health check endpoint.
-    - Returns a simple JSON object to confirm the API is running.
-    - Can be used by monitoring tools or the frontend to verify the backend is alive.
+    - Use this to verify that the backend is running.
+    - Returns {"status": "ok"} if the server is alive.
+    - Can be called from the frontend before sending AI requests.
     """
     return {"status": "ok"}
 
 @app.post("/api/sentiment")
 def sentiment():
     """
-    Sentiment analysis endpoint.
-    - Expects JSON: { "text": "some text here" }
-    - Returns a JSON object with label (POSITIVE/NEGATIVE/NEUTRAL) and score (confidence level).
+    Multilingual Sentiment Analysis Endpoint.
+    - Receives JSON: { "text": "..." }
+    - Returns JSON: { "label": "...", "score": ... }
+    - 'label' is POSITIVE / NEGATIVE / NEUTRAL (depending on model output)
+    - 'score' is the confidence value between 0 and 1.
     """
-    data = request.get_json() or {}  # Get JSON body from request, or empty dict if missing
-    text = (data.get("text") or "").strip()  # Extract 'text' and remove extra spaces
-    if not text:
-        # If 'text' is missing or empty, return HTTP 400 Bad Request
-        return jsonify({"error": "text is required"}), 400
+    # Parse JSON request body, fallback to empty dict if invalid/missing
+    data = request.get_json() or {}
     
-    # Run the sentiment model on the input text
-    # Example output: {'label': 'POSITIVE', 'score': 0.987}
-    out = get_sentiment()(text)[0]
-    return jsonify(out)  # Send the result as JSON
+    # Extract 'text' field and remove leading/trailing spaces
+    text = (data.get("text") or "").strip()
+
+    # Validate the text input
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    if len(text) > MAX_INPUT_CHARS:
+        return jsonify({"error": f"text too long (>{MAX_INPUT_CHARS} chars)"}), 413
+
+    # Perform sentiment analysis using our loaded pipeline
+    # The pipeline returns a list of results; we take the first one
+    result = get_sentiment()(text)[0]
+
+    # Send the result back as JSON
+    return jsonify(result)
 
 @app.post("/api/summarize")
 def summarize():
     """
-    Text summarization endpoint.
-    - Expects JSON: { "text": "long text here" }
-    - Returns a JSON object with a shorter summary of the text.
+    Multilingual Text Summarization Endpoint.
+    - Receives JSON: { "text": "..." }
+    - Returns JSON: { "summary": "..." }
+    - Summarization will produce a shorter text that retains the main idea.
     """
-    data = request.get_json() or {}  # Get JSON body
-    text = (data.get("text") or "").strip()  # Extract 'text' and remove extra spaces
+    # Parse JSON request body
+    data = request.get_json() or {}
+    
+    # Extract 'text' field and remove spaces
+    text = (data.get("text") or "").strip()
+
+    # Validate input
     if not text:
         return jsonify({"error": "text is required"}), 400
-    
-    # Generate a summary with constraints:
-    # - max_length: maximum tokens in output
-    # - min_length: minimum tokens in output
-    # - do_sample=False: deterministic output instead of random sampling
-    res = get_summarizer()(text, max_length=120, min_length=30, do_sample=False)[0]["summary_text"]
-    return jsonify({"summary": res})
+    if len(text) > MAX_INPUT_CHARS:
+        return jsonify({"error": f"text too long (>{MAX_INPUT_CHARS} chars)"}), 413
+
+    # Run summarization model with length constraints
+    # - max_length: maximum number of tokens in output
+    # - min_length: minimum number of tokens in output
+    # - do_sample=False: deterministic output
+    out = get_summarizer()(text, max_length=120, min_length=30, do_sample=False)[0]["summary_text"]
+
+    # Send JSON response with the summary
+    return jsonify({"summary": out})
+
+# -------------------------------------------------------------
+# Development Server
+# -------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Start the Flask development server
-    # host="127.0.0.1" → accessible only from your machine (localhost)
-    # port=5000 → backend available at http://127.0.0.1:5000
-    # debug=True → enables hot-reload and debug error messages
+    """
+    Run the Flask development server.
+    - host="127.0.0.1": only accessible locally
+    - port=5000: API available at http://127.0.0.1:5000
+    - debug=True: enables auto-reload and detailed error messages
+    """
     app.run(host="127.0.0.1", port=5000, debug=True)
