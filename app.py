@@ -3,6 +3,11 @@ from flask_cors import CORS
 from transformers import pipeline
 from huggingface_hub import hf_hub_download, model_info
 import threading
+import re
+from langdetect import detect, DetectorFactory  # language detection
+
+# Make language detection deterministic across runs
+DetectorFactory.seed = 0
 
 # -------------------------------------------------------------
 # Flask App Setup
@@ -17,11 +22,15 @@ CORS(app)  # allow cross-origin requests from your SvelteKit dev server
 
 # Pipelines (lazy after warmup)
 _sentiment_pipe = None
-_summarize_pipe = None
+_summarize_pipe = None                # legacy multilingual pipeline (mT5)
+_summarize_pipes_by_lang = {}         # cache: {"en": pipe, "multi": pipe}
 
-# Multilingual models (explicit)
+# Model IDs
 SENTIMENT_MODEL_ID = "tabularisai/multilingual-sentiment-analysis"
+# Multilingual summarization (good default for ES/FR/DE/…):
 SUMMARIZE_MODEL_ID = "csebuetnlp/mT5_multilingual_XLSum"
+# English-focused summarization (fast and strong on news-like text):
+SUMMARIZE_EN_MODEL_ID = "sshleifer/distilbart-cnn-12-6"
 
 # Progress structure exposed by /status
 # - 'error': global error string (if any) during warmup
@@ -33,7 +42,7 @@ progress = {
     "total_bytes": 0,
     "models": {
         "sentiment": False,
-        "summarizer": False
+        "summarizer": False  # refers to the multilingual summarizer warmup (mT5)
     },
     "error": None,
     "model_errors": {
@@ -61,7 +70,7 @@ def get_sentiment():
 
 def get_summarizer():
     """
-    Return a (loaded) multilingual summarization pipeline.
+    Return the (loaded) multilingual summarization pipeline (mT5).
     If not initialized yet, load it on demand.
     """
     global _summarize_pipe
@@ -72,6 +81,32 @@ def get_summarizer():
             tokenizer=SUMMARIZE_MODEL_ID
         )
     return _summarize_pipe
+
+def choose_summarizer_for_lang(lang: str):
+    """
+    Return a summarization pipeline appropriate for the language.
+    - English -> distilBART CNN (fast, strong for English)
+    - Others/Unknown -> mT5 multilingual (XLSum)
+    Pipelines are cached in _summarize_pipes_by_lang to avoid reloading.
+    """
+    key = None
+    model_id = None
+    tokenizer_id = None
+
+    if lang == "en":
+        key = "en"
+        model_id = SUMMARIZE_EN_MODEL_ID
+        tokenizer_id = SUMMARIZE_EN_MODEL_ID
+    else:
+        key = "multi"
+        model_id = SUMMARIZE_MODEL_ID
+        tokenizer_id = SUMMARIZE_MODEL_ID
+
+    pipe = _summarize_pipes_by_lang.get(key)
+    if pipe is None:
+        pipe = pipeline("summarization", model=model_id, tokenizer=tokenizer_id)
+        _summarize_pipes_by_lang[key] = pipe
+    return pipe, key
 
 # -------------------------------------------------------------
 # Warmup Download with Real(ish) Progress by Aggregated Bytes
@@ -141,6 +176,9 @@ def warmup_models():
       2) Download all files and update aggregated progress during download.
       3) Initialize pipelines; mark ready only when both succeed.
       4) Surface errors (global and per-model) in progress object.
+
+    NOTE: We warm up the multilingual summarizer (mT5). The English BART model
+    is loaded lazily on first English input to keep startup time reasonable.
     """
     global _sentiment_pipe, _summarize_pipe
 
@@ -190,6 +228,58 @@ def warmup_models():
             progress["error"] = "warmup incomplete: check model_errors for details"
 
 # -------------------------------------------------------------
+# Text Utilities for Summarization
+# -------------------------------------------------------------
+
+def clean_text(text: str) -> str:
+    """
+    Light text cleanup:
+    - strip spaces
+    - collapse repeated whitespace/newlines
+    - limit very long runs of punctuation
+    """
+    t = text.strip()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"([!?.,])\1{3,}", r"\1\1", t)  # limit repeated punctuation
+    return t
+
+def detect_lang_safe(text: str) -> str:
+    """
+    Best-effort language detection. Returns ISO-639-1 like "en", "es", ...
+    If detection fails, return 'unknown'.
+    """
+    try:
+        lang = detect(text)
+        return lang or "unknown"
+    except Exception:
+        return "unknown"
+
+def summarization_params_for_length(text: str) -> dict:
+    """
+    Pick sensible max/min lengths based on input size (rough heuristic by words).
+    Adjust these to your data shape if needed.
+    """
+    wc = len(text.split())
+    if wc < 60:
+        return {"max_length": 60, "min_length": 20}
+    elif wc < 180:
+        return {"max_length": 120, "min_length": 40}
+    elif wc < 400:
+        return {"max_length": 180, "min_length": 60}
+    else:
+        return {"max_length": 220, "min_length": 80}
+
+def maybe_prefix_for_t5(model_key: str, text: str) -> str:
+    """
+    For T5/mT5-like models, prefixing with 'summarize:' often improves behavior.
+    For BART-like models, no prefix is needed.
+    model_key == 'multi' -> mT5 path; anything else -> no prefix.
+    """
+    if model_key == "multi":
+        return f"summarize: {text}"
+    return text
+
+# -------------------------------------------------------------
 # API Endpoints
 # -------------------------------------------------------------
 
@@ -227,26 +317,64 @@ def sentiment():
 @app.post("/api/summarize")
 def summarize():
     """
-    Multilingual summarization.
-    Input: { "text": "..." }
-    Output: { "summary": "..." }
+    Language-aware summarization.
+    Steps:
+      - Validate and clean input
+      - Detect language
+      - Route to best model (EN -> BART CNN, others -> mT5 multilingual)
+      - Add light prompt for mT5 ('summarize: ')
+      - Tune max/min lengths based on input size
+    Input:  { "text": "..." }
+    Output: { "summary": "..." , "lang": "...", "model": "...", "params": {...} }
     """
     data = request.get_json() or {}
-    text = (data.get("text") or "").strip()
+    text_raw = (data.get("text") or "")
 
-    if not text:
+    # Basic validation
+    if not text_raw.strip():
         return jsonify({"error": "text is required"}), 400
-    if len(text) > MAX_INPUT_CHARS:
+    if len(text_raw) > MAX_INPUT_CHARS:
         return jsonify({"error": f"text too long (>{MAX_INPUT_CHARS} chars)"}), 413
 
-    out = get_summarizer()(text, max_length=120, min_length=30, do_sample=False)[0]["summary_text"]
-    return jsonify({"summary": out})
+    # Cleanup
+    text = clean_text(text_raw)
+
+    # Language detection
+    lang = detect_lang_safe(text)
+
+    # Choose summarizer and params
+    pipe, model_key = choose_summarizer_for_lang(lang)
+    gen_kwargs = summarization_params_for_length(text)
+
+    # Add light prompt for mT5; leave as-is for BART
+    guided = maybe_prefix_for_t5(model_key, text)
+
+    # Run model
+    try:
+        out = pipe(
+            guided,
+            do_sample=False,
+            **gen_kwargs
+        )
+        # HF pipelines may return 'summary_text' (T5/BART) or 'generated_text' (some models)
+        summary = out[0].get("summary_text") or out[0].get("generated_text") or ""
+        summary = summary.strip()
+        return jsonify({
+            "summary": summary,
+            "lang": lang,
+            "model": ("bart-cnn" if model_key == "en" else "mT5-multilingual"),
+            "params": gen_kwargs
+        })
+    except Exception as e:
+        return jsonify({"error": f"summarization failed: {e}"}), 500
 
 # -------------------------------------------------------------
 # Dev Server (launch warmup thread)
 # -------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Start warmup in background so the server is responsive immediately
+    # Start warmup in background so the server is responsive immediately.
+    # Warmup initializes sentiment and the multilingual summarizer (mT5).
+    # English BART summarizer is lazy-loaded on first 'en' input to keep startup snappy.
     threading.Thread(target=warmup_models, daemon=True).start()
     app.run(host="127.0.0.1", port=5000, debug=True)
